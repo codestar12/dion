@@ -218,6 +218,14 @@ def dion2_update_megabatch_async(
     # comm_dim for sharded communication: use select_dim (which equals normalized shard_dim)
     comm_dim = select_dim if is_sharded else None
 
+    # Locally compute the rank-consistent padded local size from the unsharded
+    # global shape (X[0] is still a DTensor here). Avoids the per-step
+    # allreduce + .item() sync inside megabatch_orthogonalize_async.
+    if comm_dim is not None:
+        padded_local_size = -(-X[0].shape[comm_dim] // world_size)
+    else:
+        padded_local_size = None
+
     # Orthogonalize via shared megabatch communication
     U_ortho = yield from megabatch_orthogonalize_async(
         U_selected,
@@ -228,6 +236,7 @@ def dion2_update_megabatch_async(
         newton_schulz_func=newton_schulz_func,
         flatten=flatten,
         epsilon=epsilon,
+        padded_local_size=padded_local_size,
     )
 
     # Compute scaled learning rate

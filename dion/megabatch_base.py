@@ -290,6 +290,7 @@ def megabatch_orthogonalize_async(
     newton_schulz_func: Callable,
     flatten: bool,
     epsilon: Tensor,
+    padded_local_size: Optional[int] = None,
 ) -> Generator[None, None, List[Tensor]]:
     """
     Shared megabatch communication + Newton-Schulz orthogonalization.
@@ -310,6 +311,10 @@ def megabatch_orthogonalize_async(
         newton_schulz_func: Newton-Schulz orthogonalization function.
         flatten: Whether to flatten 3D+ tensors to 2D.
         epsilon: Small value for numerical stability.
+        padded_local_size: Required when ``comm_dim is not None``. The
+            rank-consistent padded local size along ``comm_dim``, computed by
+            the caller as ``ceil(global_dim / world_size)`` from the unsharded
+            DTensor's global shape. Avoids a per-step allreduce + GPU->CPU sync.
     """
     N = len(U)
 
@@ -325,21 +330,22 @@ def megabatch_orthogonalize_async(
     if comm_dim is not None and process_group is not None:
         # --- Mega-batched sharded FSDP2 path ---
 
-        # Pad each rank's local shard along comm_dim to a rank-consistent
-        # ``padded_local_size`` so dist.all_to_all sees uniform per-pair
-        # sizes. FSDP2 contiguous chunking otherwise leaves some ranks with
-        # empty (numel=0) shards when the sharded global dim is smaller than
-        # world_size or doesn't divide evenly to fill all ranks (e.g. shape
-        # (18, D) over world_size=8: ranks 6 and 7 hold (0, D) shards). Without
-        # padding the alltoall has mismatched per-pair sizes and hangs.
-        # Newton-Schulz preserves zero rows (they contribute nothing to U^T U),
-        # so padding doesn't change the orthogonalization of the real rows.
-        original_local_size = U_work[0].size(comm_dim)
-        local_size_t = torch.tensor(
-            [original_local_size], device=U_work[0].device, dtype=torch.long
+        # Pad each rank's local shard along comm_dim to ``padded_local_size``
+        # (passed by the caller, equal to ceil(global_dim / world_size)) so
+        # dist.all_to_all sees uniform per-pair sizes. FSDP2 contiguous chunking
+        # otherwise leaves some ranks with empty (numel=0) shards when the
+        # sharded global dim is smaller than world_size or doesn't divide
+        # evenly to fill all ranks (e.g. shape (18, D) over world_size=8: ranks
+        # 6 and 7 hold (0, D) shards). Without padding the alltoall has
+        # mismatched per-pair sizes and hangs. Newton-Schulz preserves zero
+        # rows (they contribute nothing to U^T U), so padding doesn't change
+        # the orthogonalization of the real rows.
+        assert padded_local_size is not None, (
+            "padded_local_size must be passed when comm_dim is not None; "
+            "callers should compute ceil(global_dim / world_size) from the "
+            "unsharded DTensor shape."
         )
-        dist.all_reduce(local_size_t, op=dist.ReduceOp.MAX, group=process_group)
-        padded_local_size = int(local_size_t.item())
+        original_local_size = U_work[0].size(comm_dim)
 
         if padded_local_size != original_local_size:
             # F.pad's pad-spec is built from the LAST dim backwards. comm_dim

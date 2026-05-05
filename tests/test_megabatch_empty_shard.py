@@ -56,6 +56,7 @@ def _worker(rank: int, world_size: int, global_dim_0: int, dim_1: int, n_params:
             U.append(torch.randn(local_shape, dtype=torch.float32, device=device, generator=g))
 
     state = {}
+    padded_local_size = -(-global_dim_0 // world_size)
 
     def _task_gen():
         result = yield from megabatch_orthogonalize_async(
@@ -67,6 +68,7 @@ def _worker(rank: int, world_size: int, global_dim_0: int, dim_1: int, n_params:
             newton_schulz_func=_ns_func,
             flatten=False,
             epsilon=torch.tensor(1e-7, device=device),
+            padded_local_size=padded_local_size,
         )
         state["result"] = result
 
@@ -82,10 +84,14 @@ def _worker(rank: int, world_size: int, global_dim_0: int, dim_1: int, n_params:
     dist.destroy_process_group()
 
 
-@pytest.mark.skipif(CUDA_DEVICE_COUNT < 4, reason="needs >= 4 CUDA devices for NCCL alltoall")
 @pytest.mark.parametrize(
     "global_dim_0, world_size, n_params",
     [
+        # world_size=2 cases (run on 2-GPU dev boxes too):
+        # 1 row over 2 ranks: rank 0 has (1, D), rank 1 has (0, D) — empty shard.
+        (1, 2, 8),
+        # 3 rows over 2 ranks: (2, D) + (1, D) — non-divisible, no empty.
+        (3, 2, 8),
         # 5 rows over 4 ranks: ceil(5/4)=2 chunks of size 2 fill ranks 0..2, rank 3 empty.
         # Mirrors the sparse-3b (18, D) over 8 ranks pattern at smaller scale.
         (5, 4, 8),
@@ -96,6 +102,8 @@ def _worker(rank: int, world_size: int, global_dim_0: int, dim_1: int, n_params:
     ],
 )
 def test_megabatch_orthogonalize_async_handles_empty_shards(global_dim_0, world_size, n_params):
+    if CUDA_DEVICE_COUNT < world_size:
+        pytest.skip(f"needs >= {world_size} CUDA devices for NCCL alltoall")
     # Unique port per parametrization to avoid bind collisions.
     port = 29500 + global_dim_0 * 100 + world_size
     mp.spawn(
