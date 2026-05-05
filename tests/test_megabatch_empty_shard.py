@@ -56,7 +56,6 @@ def _worker(rank: int, world_size: int, global_dim_0: int, dim_1: int, n_params:
             U.append(torch.randn(local_shape, dtype=torch.float32, device=device, generator=g))
 
     state = {}
-    padded_local_size = -(-global_dim_0 // world_size)
 
     def _task_gen():
         result = yield from megabatch_orthogonalize_async(
@@ -68,7 +67,7 @@ def _worker(rank: int, world_size: int, global_dim_0: int, dim_1: int, n_params:
             newton_schulz_func=_ns_func,
             flatten=False,
             epsilon=torch.tensor(1e-7, device=device),
-            padded_local_size=padded_local_size,
+            global_comm_dim_size=global_dim_0,
         )
         state["result"] = result
 
