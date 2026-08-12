@@ -1,6 +1,6 @@
 """Tests for eager optimizer-state pre-population in DistributedOrthoBase.
 
-The DistributedOrthoBase family (Muon, NorMuon, Dion2, NorDion2) materializes
+The DistributedOrthoBase family (Muon, NorMuon, Dion2, Aurora) materializes
 optimizer state for every parameter at construction time, including parameters
 that may never receive a gradient. This keeps state_dict() complete and
 rank-symmetric (a requirement for distributed checkpointing) and is numerically
@@ -17,14 +17,14 @@ CUDA_AVAILABLE = torch.cuda.is_available()
 
 
 def _optimizer_cases():
-    from dion import Dion2, Muon, NorDion2, NorMuon
+    from dion import Aurora, Dion2, Muon, NorMuon
 
     # (class, kwargs, extra state keys beyond "momentum" for the ortho algo)
     return [
         (Muon, dict(lr=0.01), set()),
         (NorMuon, dict(lr=0.01), {"variance_neuron"}),
         (Dion2, dict(lr=0.01), set()),
-        (NorDion2, dict(lr=0.01), {"variance_neuron"}),
+        (Aurora, dict(lr=0.01), set()),
     ]
 
 
@@ -82,6 +82,40 @@ def test_add_param_group_prepopulates(opt_cls, opt_kwargs, extra_keys):
     expected_keys = {"momentum"} | extra_keys
     assert set(opt.state[late].keys()) == expected_keys
     assert set(opt.state_dict()["state"].keys()) == {0, 1}
+
+
+def test_muon_prepopulates_adamw_fallback_state():
+    """Mirror MuonMS: matrix weights use Muon and scalar weights use AdamW."""
+    from dion import Muon
+
+    matrix, _ = _make_params()
+    fallback = torch.nn.Parameter(torch.randn(128, device=DEVICE))
+    opt = Muon(
+        [
+            {"params": [matrix]},
+            {"params": [fallback], "algorithm": "adamw"},
+        ],
+        lr=0.01,
+    )
+
+    assert set(opt.state[matrix]) == {"momentum"}
+    assert set(opt.state[fallback]) == {"momentum", "variance"}
+    assert torch.count_nonzero(opt.state[fallback]["momentum"]) == 0
+    assert torch.count_nonzero(opt.state[fallback]["variance"]) == 0
+    assert set(opt.state_dict()["state"]) == {0, 1}
+
+
+def test_late_adamw_fallback_group_is_prepopulated():
+    from dion import Muon
+
+    matrix, _ = _make_params()
+    opt = Muon([matrix], lr=0.01)
+    fallback = torch.nn.Parameter(torch.randn(128, device=DEVICE))
+    opt.add_param_group({"params": [fallback], "algorithm": "adamw"})
+
+    assert set(opt.state[fallback]) == {"momentum", "variance"}
+    assert torch.count_nonzero(opt.state[fallback]["momentum"]) == 0
+    assert torch.count_nonzero(opt.state[fallback]["variance"]) == 0
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required for optimizer step")

@@ -20,7 +20,6 @@ from dion.megabatch_base import megabatch_orthogonalize_async
 from dion.opt_utils import AsyncRuntime, AsyncTask
 from dion.polar_express import polar_express
 
-
 CUDA_DEVICE_COUNT = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
 
@@ -28,7 +27,9 @@ def _ns_func(x, epsilon=1e-7):
     return polar_express(x, epsilon=epsilon)
 
 
-def _worker(rank: int, world_size: int, global_dim_0: int, dim_1: int, n_params: int, port: int) -> None:
+def _worker(
+    rank: int, world_size: int, global_dim_0: int, dim_1: int, n_params: int, port: int
+) -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     torch.cuda.set_device(rank)
@@ -40,7 +41,11 @@ def _worker(rank: int, world_size: int, global_dim_0: int, dim_1: int, n_params:
     # FSDP2 narrows the per-rank shard back to 2D shape (k, dim_1) where k>=0
     # and k=0 for padding-only ranks (see _init_sharded_param in
     # torch/distributed/fsdp/_fully_shard/_fsdp_param.py).
-    full = torch.arange(global_dim_0 * dim_1, device=device).view(global_dim_0, dim_1).float()
+    full = (
+        torch.arange(global_dim_0 * dim_1, device=device)
+        .view(global_dim_0, dim_1)
+        .float()
+    )
     real_chunks = list(torch.chunk(full, world_size, dim=0))
     if rank < len(real_chunks):
         local_shape = real_chunks[rank].shape
@@ -53,7 +58,11 @@ def _worker(rank: int, world_size: int, global_dim_0: int, dim_1: int, n_params:
             U.append(torch.zeros(local_shape, dtype=torch.float32, device=device))
         else:
             g = torch.Generator(device=device).manual_seed(rank * 17 + i)
-            U.append(torch.randn(local_shape, dtype=torch.float32, device=device, generator=g))
+            U.append(
+                torch.randn(
+                    local_shape, dtype=torch.float32, device=device, generator=g
+                )
+            )
 
     state = {}
 
@@ -71,14 +80,16 @@ def _worker(rank: int, world_size: int, global_dim_0: int, dim_1: int, n_params:
         )
         state["result"] = result
 
-    runtime = AsyncRuntime((t for t in [AsyncTask(_task_gen())]), max_concurrent_tasks=1)
+    runtime = AsyncRuntime(
+        (t for t in [AsyncTask(_task_gen())]), max_concurrent_tasks=1
+    )
     runtime.run()
 
     assert len(state["result"]) == n_params
     for t in state["result"]:
-        assert t.shape == local_shape, (
-            f"rank {rank}: expected {local_shape}, got {tuple(t.shape)}"
-        )
+        assert (
+            t.shape == local_shape
+        ), f"rank {rank}: expected {local_shape}, got {tuple(t.shape)}"
 
     dist.destroy_process_group()
 
@@ -100,7 +111,9 @@ def _worker(rank: int, world_size: int, global_dim_0: int, dim_1: int, n_params:
         (15, 4, 8),
     ],
 )
-def test_megabatch_orthogonalize_async_handles_empty_shards(global_dim_0, world_size, n_params):
+def test_megabatch_orthogonalize_async_handles_empty_shards(
+    global_dim_0, world_size, n_params
+):
     if CUDA_DEVICE_COUNT < world_size:
         pytest.skip(f"needs >= {world_size} CUDA devices for NCCL alltoall")
     # Unique port per parametrization to avoid bind collisions.

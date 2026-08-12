@@ -222,6 +222,20 @@ def aurora_update_megabatch_async(
     # Convert shard_dim to negative for comm_dim
     comm_dim = (shard_dim - X[0].ndim) if shard_dim is not None else None
 
+    # On the sharded path X[0] must still be a DTensor, so .shape[comm_dim]
+    # is the unsharded global size. The Aurora megabatch path needs that size
+    # both to make all-to-all inputs uniform and to exclude padding rows from
+    # its leverage-normalization target.
+    if comm_dim is not None:
+        if not isinstance(X[0], DTensor):
+            raise TypeError(
+                "Sharded path requires X[0] to be a DTensor so .shape gives "
+                f"the global size; got {type(X[0]).__name__}."
+            )
+        global_comm_dim_size = X[0].shape[comm_dim]
+    else:
+        global_comm_dim_size = None
+
     # Aurora D-iteration polar via megabatch communication
     U = yield from megabatch_aurora_orthogonalize_async(
         U,
@@ -234,6 +248,7 @@ def aurora_update_megabatch_async(
         epsilon=epsilon,
         pp_iterations=pp_iterations,
         pp_beta=pp_beta,
+        global_comm_dim_size=global_comm_dim_size,
     )
 
     # Compute scaled learning rate
@@ -270,6 +285,7 @@ def megabatch_aurora_orthogonalize_async(
     epsilon: Tensor,
     pp_iterations: int,
     pp_beta: float,
+    global_comm_dim_size: Optional[int],
 ) -> Generator[None, None, List[Tensor]]:
     """
     Megabatch communication + Aurora D-iteration polar decomposition.
@@ -294,6 +310,29 @@ def megabatch_aurora_orthogonalize_async(
 
     if comm_dim is not None and process_group is not None:
         # --- Mega-batched sharded FSDP2 path ---
+        if global_comm_dim_size is None:
+            raise ValueError(
+                "global_comm_dim_size must be passed when comm_dim is not "
+                "None; callers should pass the unsharded DTensor's global "
+                "size along comm_dim."
+            )
+        padded_local_size = (global_comm_dim_size + world_size - 1) // world_size
+        original_local_size = U_work[0].size(comm_dim)
+        if padded_local_size < original_local_size:
+            raise RuntimeError(
+                f"padded_local_size ({padded_local_size}) < this rank's "
+                f"local size ({original_local_size}); FSDP2 contiguous-"
+                f"chunking assumption violated (global_comm_dim_size="
+                f"{global_comm_dim_size}, world_size={world_size})."
+            )
+
+        if padded_local_size != original_local_size:
+            pad_spec = [0, 0] * (-comm_dim - 1) + [
+                0,
+                padded_local_size - original_local_size,
+            ]
+            U_work = [torch.nn.functional.pad(u, pad_spec) for u in U_work]
+
         input_chunks = [
             torch.stack(U_work[r * per_rank : (r + 1) * per_rank])
             for r in range(world_size)
@@ -307,14 +346,33 @@ def megabatch_aurora_orthogonalize_async(
         work.wait()
 
         full_matrices = torch.cat(output_chunks, dim=comm_dim)
-        full_matrices = aurora_process_matrices(
-            full_matrices,
+
+        # Unlike the standard Muon polar transform, Aurora's target row norm
+        # depends explicitly on the matrix height. Exclude synthetic padding
+        # rows while processing so uneven sharding is numerically identical to
+        # processing the true global matrix, then restore the rows only for the
+        # equal-sized return collective.
+        real_matrices = full_matrices.narrow(
+            comm_dim, 0, global_comm_dim_size
+        ).contiguous()
+        real_matrices = aurora_process_matrices(
+            real_matrices,
             newton_schulz_func=newton_schulz_func,
             flatten=flatten,
             epsilon=epsilon,
             pp_iterations=pp_iterations,
             pp_beta=pp_beta,
         )
+
+        padded_global_size = padded_local_size * world_size
+        if padded_global_size != global_comm_dim_size:
+            pad_spec = [0, 0] * (-comm_dim - 1) + [
+                0,
+                padded_global_size - global_comm_dim_size,
+            ]
+            full_matrices = torch.nn.functional.pad(real_matrices, pad_spec)
+        else:
+            full_matrices = real_matrices
 
         split_chunks = [
             s.contiguous()
@@ -328,7 +386,11 @@ def megabatch_aurora_orthogonalize_async(
         yield
         work.wait()
 
-        result = [recv_chunks[r][i] for r in range(world_size) for i in range(per_rank)]
+        result = [
+            recv_chunks[r][i].narrow(comm_dim, 0, original_local_size).contiguous()
+            for r in range(world_size)
+            for i in range(per_rank)
+        ]
         return result[:N]
 
     elif N > 1 and process_group is not None:
