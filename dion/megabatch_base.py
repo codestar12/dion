@@ -371,9 +371,10 @@ def megabatch_orthogonalize_async(
         # global dim is smaller than world_size or doesn't divide evenly to
         # fill all ranks (e.g. shape (18, D) over world_size=8: ranks 6 and 7
         # hold (0, D) shards). Without padding the alltoall has mismatched
-        # per-pair sizes and hangs. Newton-Schulz preserves zero rows (they
-        # contribute nothing to U^T U), so padding doesn't change the
-        # orthogonalization of the real rows.
+        # per-pair sizes and hangs. The padding is transport-only: after the
+        # first all-to-all, it is removed before Newton-Schulz and restored
+        # before the return all-to-all. This avoids feeding synthetic rows to
+        # finite-precision orthogonalization kernels.
         #
         # NOTE: this assumes FSDP2-style contiguous chunking, where every rank
         # holds at most ceil(global / world_size) elements along comm_dim. If
@@ -398,7 +399,10 @@ def megabatch_orthogonalize_async(
         if padded_local_size != original_local_size:
             # F.pad's pad-spec is built from the LAST dim backwards. comm_dim
             # is negative; pad only the END of comm_dim.
-            pad_spec = [0, 0] * (-comm_dim - 1) + [0, padded_local_size - original_local_size]
+            pad_spec = [0, 0] * (-comm_dim - 1) + [
+                0,
+                padded_local_size - original_local_size,
+            ]
             U_work = [torch.nn.functional.pad(u, pad_spec) for u in U_work]
 
         input_chunks = [
@@ -413,14 +417,31 @@ def megabatch_orthogonalize_async(
         yield
         work.wait()
 
-        # comm_dim is negative, so it correctly indexes the stacked tensor
+        # comm_dim is negative, so it correctly indexes the stacked tensor.
+        # Remove synthetic transport rows before orthogonalization. In exact
+        # arithmetic zero padding is inert, but Polar Express runs in BF16 and
+        # a different GEMM shape can change reduction order/kernel selection.
+        # Cropping here keeps the optimizer computation topology-stable while
+        # retaining uniform all-to-all payloads for uneven and empty shards.
         full_matrices = torch.cat(output_chunks, dim=comm_dim)
+        transport_size = padded_local_size * world_size
+        if transport_size != global_comm_dim_size:
+            full_matrices = full_matrices.narrow(
+                comm_dim, 0, global_comm_dim_size
+            ).contiguous()
         full_matrices = muon_update_newton_schulz(
             full_matrices,
             newton_schulz_func=newton_schulz_func,
             flatten=flatten,
             epsilon=epsilon,
         )
+
+        if transport_size != global_comm_dim_size:
+            pad_spec = [0, 0] * (-comm_dim - 1) + [
+                0,
+                transport_size - global_comm_dim_size,
+            ]
+            full_matrices = torch.nn.functional.pad(full_matrices, pad_spec)
 
         split_chunks = [
             s.contiguous()

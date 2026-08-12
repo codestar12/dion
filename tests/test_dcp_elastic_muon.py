@@ -454,7 +454,7 @@ def _load_phase(run_dir: Path) -> None:
     optimizer.step()  # real NCCL all-to-all, including the empty local shard
     resumed = _full_snapshot(model, optimizer, DTensor)
     topology_oracles = _topology_oracles(torch, loaded, dist.get_world_size())
-    target_after = topology_oracles["batched_padded"]
+    target_after = topology_oracles["batched_unpadded"]
     if dist.get_rank() == 0:
         metrics = {
             label: _comparison_metrics(torch, resumed, oracle["after"], topology_oracle)
@@ -481,9 +481,9 @@ def _load_phase(run_dir: Path) -> None:
                 {key: target_after[key]},
                 "after resumed Muon state update",
             )
-    # The distributed result must match a direct destination-topology oracle.
-    # Cross-topology source drift is reported in metrics.json because padding
-    # changes BF16 GEMM kernel shapes despite exact-arithmetic equivalence.
+    # The distributed result must match the batched, true-global-extent oracle.
+    # Padding exists only in the all-to-all transport and is cropped before the
+    # BF16 polar kernel, avoiding topology-dependent synthetic-row drift.
     for key in resumed:
         if key.startswith("model."):
             torch.testing.assert_close(
